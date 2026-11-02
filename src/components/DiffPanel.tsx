@@ -1,13 +1,15 @@
 import { useMemo, useState } from "react";
-import { diffLines } from "../lib/diff";
+import { DiffResult, diffLines } from "../lib/diff";
 import { Format } from "../lib/format";
 import { highlightLine } from "../lib/highlight";
 
 interface Props {
   leftLabel: string;
   rightLabel: string;
-  leftText: string;
-  rightText: string;
+  leftText?: string;
+  rightText?: string;
+  /** 已算好的对比结果（按 key 对齐等模式）；提供时忽略 leftText / rightText。 */
+  result?: DiffResult;
   /** 提供时按该格式做语法高亮（TEXT 不高亮）。 */
   format?: Format;
 }
@@ -27,9 +29,19 @@ function Cell({ text, side, format }: { text: string | null; side: string; forma
 }
 
 /** 并排展示两段文本的智能行级差异：增/删/改高亮 + 变更统计，可只看变更行。 */
-export default function DiffPanel({ leftLabel, rightLabel, leftText, rightText, format }: Props) {
+export default function DiffPanel({
+  leftLabel,
+  rightLabel,
+  leftText = "",
+  rightText = "",
+  result: given,
+  format,
+}: Props) {
   const [onlyChanges, setOnlyChanges] = useState(false);
-  const result = useMemo(() => diffLines(leftText, rightText), [leftText, rightText]);
+  const result = useMemo(
+    () => given ?? diffLines(leftText, rightText),
+    [given, leftText, rightText]
+  );
 
   const rows = useMemo(
     () => (onlyChanges ? result.rows.filter((r) => r.type !== "equal") : result.rows),
