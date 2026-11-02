@@ -1,24 +1,13 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Connection } from "../store/connections";
 import { ConfigItem, getConfig, listConfigs, listNamespaces, Namespace } from "../api/nacos";
 import { detectFormat, Format } from "../lib/format";
-import { keysDoc } from "../lib/keys";
+import { diffByKey, parseEntries } from "../lib/keyed";
 import Combobox from "./Combobox";
 import DiffPanel from "./DiffPanel";
 import Select from "./Select";
 
-type DiffMode = "text" | "key" | "lines";
-
-/** 忽略顺序的整行对比:去空行、按行排序后再 diff(保留值,只忽略顺序)。 */
-function sortedLinesDoc(content: string): string {
-  return content
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    .map((l) => l.replace(/\s+$/, ""))
-    .filter((l) => l.trim() !== "")
-    .sort()
-    .join("\n");
-}
+type DiffMode = "text" | "keyed" | "keys";
 
 interface Props {
   connections: Connection[];
@@ -159,6 +148,16 @@ export default function DiffView({ connections }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [mode, setMode] = useState<DiffMode>("text");
 
+  // 文本模式逐行 diff；其余模式解析成键路径后按 key 对齐（忽略顺序和注释）
+  const keyedResult = useMemo(() => {
+    if (!leftLoaded || !rightLoaded || mode === "text") return undefined;
+    return diffByKey(
+      parseEntries(leftLoaded.content, leftLoaded.format),
+      parseEntries(rightLoaded.content, rightLoaded.format),
+      mode === "keys"
+    );
+  }, [leftLoaded, rightLoaded, mode]);
+
   if (connections.length === 0) {
     return <div className="pad-msg big">请先在「连接管理」中添加 Nacos 连接</div>;
   }
@@ -169,11 +168,19 @@ export default function DiffView({ connections }: Props) {
     if (!conn) throw "未选择连接";
     if (!src.dataId.trim()) throw "未填写 dataId";
     const group = src.group.trim() || "DEFAULT_GROUP";
-    const content = await getConfig(conn, src.tenant, src.dataId.trim(), group);
+    const dataId = src.dataId.trim();
+    // 内容接口不带类型,另查一次列表拿 Nacos 上设置的类型;查不到再按后缀 / 内容猜
+    const [content, configType] = await Promise.all([
+      getConfig(conn, src.tenant, dataId, group),
+      listConfigs(conn, src.tenant, dataId, group, 1, 10)
+        .then((p) => p.pageItems.find((c) => c.dataId === dataId && c.group === group)?.configType ?? "")
+        .catch(() => ""),
+    ]);
     return {
-      label: `${conn.name} · ${src.tenant || "public"} · ${src.dataId.trim()}`,
+      label: `${conn.name} · ${src.tenant || "public"} · ${dataId}`,
       content,
-      format: detectFormat(src.dataId.trim(), "", content),
+      // text 是 Nacos 新建配置的默认类型,不代表真是纯文本,交给后缀 / 内容去猜
+      format: detectFormat(dataId, configType === "text" ? "" : configType, content),
     };
   };
 
@@ -198,13 +205,14 @@ export default function DiffView({ connections }: Props) {
   };
 
   const ready = leftLoaded && rightLoaded;
-  // 按对比模式决定喂给 diff 的文本
-  const prep = (l: Loaded) =>
-    mode === "key" ? keysDoc(l.content, l.format) : mode === "lines" ? sortedLinesDoc(l.content) : l.content;
-  const leftText = ready ? prep(leftLoaded!) : "";
-  const rightText = ready ? prep(rightLoaded!) : "";
   const diffFormat =
-    mode === "key" ? "TEXT" : leftLoaded?.format !== "TEXT" ? leftLoaded?.format : rightLoaded?.format;
+    mode === "keys"
+      ? "TEXT"
+      : mode === "keyed"
+        ? "YAML"
+        : leftLoaded?.format !== "TEXT"
+          ? leftLoaded?.format
+          : rightLoaded?.format;
 
   return (
     <div className="diff-view">
@@ -218,8 +226,8 @@ export default function DiffView({ connections }: Props) {
           value={mode}
           options={[
             { value: "text", label: "文本(逐行)" },
-            { value: "lines", label: "忽略顺序(整行)" },
-            { value: "key", label: "仅 Key(忽略顺序)" },
+            { value: "keyed", label: "按 Key 对齐(忽略顺序和注释)" },
+            { value: "keys", label: "仅 Key(忽略值)" },
           ]}
           onChange={(v) => setMode(v as DiffMode)}
         />
@@ -233,8 +241,9 @@ export default function DiffView({ connections }: Props) {
           <DiffPanel
             leftLabel={leftLoaded!.label}
             rightLabel={rightLoaded!.label}
-            leftText={leftText}
-            rightText={rightText}
+            leftText={leftLoaded!.content}
+            rightText={rightLoaded!.content}
+            result={keyedResult}
             format={diffFormat}
           />
         ) : (
