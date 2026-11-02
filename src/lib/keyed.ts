@@ -65,7 +65,35 @@ function walkYaml(
 
 const unquote = (s: string) => s.replace(/^(["'])(.*)\1$/, "$2");
 
-type LineMode = "yaml" | "properties" | "toml" | "raw";
+/** 还原 properties 转义:\uXXXX、\t \n \r \f,其余 \X 取 X。 */
+function unescapeProps(s: string): string {
+  return s.replace(/\\(u[0-9a-fA-F]{4}|.)/g, (_, c: string) => {
+    if (c.length === 5) return String.fromCharCode(parseInt(c.slice(1), 16));
+    return { t: "\t", n: "\n", r: "\r", f: "\f" }[c] ?? c;
+  });
+}
+
+/** Java properties:# / ! 注释、行尾奇数个 \ 续行、分隔符为 = : 或空白。 */
+function propertiesEntries(text: string): Entry[] {
+  const out: Entry[] = [];
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = i + 1;
+    let logical = lines[i].replace(/^\s+/, "");
+    if (!logical || logical[0] === "#" || logical[0] === "!") continue;
+    // 续行:末尾连续反斜杠为奇数个时,拼上下一行(去掉其行首空白)
+    while (/(^|[^\\])(\\\\)*\\$/.test(logical) && i + 1 < lines.length) {
+      logical = logical.slice(0, -1) + lines[++i].replace(/^\s+/, "");
+    }
+    const m = logical.match(/^((?:\\.|[^\\\s=:])*)\s*[=:]?\s*(.*)$/s)!;
+    const key = unescapeProps(m[1]);
+    const value = unescapeProps(m[2].replace(/\s+$/, ""));
+    out.push({ key, value: value.includes("\n") ? JSON.stringify(value) : value, line });
+  }
+  return out;
+}
+
+type LineMode = "yaml" | "toml" | "raw";
 
 /** 逐行解析(YAML 解析失败的兜底 / properties / TOML / 其它文本)。 */
 function lineEntries(text: string, mode: LineMode): Entry[] {
@@ -85,7 +113,7 @@ function lineEntries(text: string, mode: LineMode): Entry[] {
         return;
       }
     }
-    // 行尾注释:空白后的 #(properties 没有行尾注释语法,值里的 # 要保留)
+    // 行尾注释:空白后的 #(raw 模式下 XML / HTML 里的 # 是正文,不剥)
     if (mode === "yaml" || mode === "toml") t = t.replace(/\s+#.*$/, "");
     const m = mode === "raw" ? null : t.match(/^([^=:\s][^=:]*?)\s*([=:])\s*(.*)$/);
     if (!m) {
@@ -112,7 +140,7 @@ function lineEntries(text: string, mode: LineMode): Entry[] {
 
 /** 把配置内容解析为条目。YAML / JSON 优先走真正的解析器,失败再逐行兜底。 */
 export function parseEntries(text: string, fmt: Format): Entry[] {
-  if (fmt === "Properties") return lineEntries(text, "properties");
+  if (fmt === "Properties") return propertiesEntries(text);
   if (fmt === "TOML") return lineEntries(text, "toml");
   if (fmt === "XML" || fmt === "HTML") return lineEntries(text, "raw");
   const lc = new LineCounter();

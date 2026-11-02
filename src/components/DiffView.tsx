@@ -168,11 +168,19 @@ export default function DiffView({ connections }: Props) {
     if (!conn) throw "未选择连接";
     if (!src.dataId.trim()) throw "未填写 dataId";
     const group = src.group.trim() || "DEFAULT_GROUP";
-    const content = await getConfig(conn, src.tenant, src.dataId.trim(), group);
+    const dataId = src.dataId.trim();
+    // 内容接口不带类型,另查一次列表拿 Nacos 上设置的类型;查不到再按后缀 / 内容猜
+    const [content, configType] = await Promise.all([
+      getConfig(conn, src.tenant, dataId, group),
+      listConfigs(conn, src.tenant, dataId, group, 1, 10)
+        .then((p) => p.pageItems.find((c) => c.dataId === dataId && c.group === group)?.configType ?? "")
+        .catch(() => ""),
+    ]);
     return {
-      label: `${conn.name} · ${src.tenant || "public"} · ${src.dataId.trim()}`,
+      label: `${conn.name} · ${src.tenant || "public"} · ${dataId}`,
       content,
-      format: detectFormat(src.dataId.trim(), "", content),
+      // text 是 Nacos 新建配置的默认类型,不代表真是纯文本,交给后缀 / 内容去猜
+      format: detectFormat(dataId, configType === "text" ? "" : configType, content),
     };
   };
 
