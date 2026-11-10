@@ -76,57 +76,59 @@ const PEM_BEGIN = /-----BEGIN [^-]+-----/;
 const PEM_END = /-----END [^-]+-----/;
 const MAX_MULTILINE = 200;
 
-/** 逐行兜底时识别跨行的值:引号没闭合,或 PEM 块没结束(私钥 / 证书常被顶格直接贴进来,
- *  这不是合法 YAML,所以整份才会落到兜底)。返回合并后的值和多用掉的行数;不是跨行值返回 null。 */
+const indentOf = (src: string) => src.match(/^\s*/)![0].replace(/\t/g, "  ").length;
+
+/** 逐行兜底时识别跨行的值,合并回所属的 key。配置里只要有一处不是合法 YAML,整份都会落到
+ *  兜底,所以规范写法(`|` 块)和不规范写法(私钥 / 密文顶格直接贴)都要认:
+ *  - `|` / `>` 块:后面比 key 缩进更深的行;
+ *  - `|` 块或空值后面紧跟顶格的 PEM(-----BEGIN … 到 -----END …);
+ *  - key 同一行上引号没闭合,或 PEM 块没结束。
+ *  返回合并后的值和多用掉的行数;不是跨行值返回 null(找不到结尾也返回 null,不吞后面的行)。 */
 function multilineValue(
   first: string,
   lines: string[],
-  next: number
+  next: number,
+  keyIndent: number
 ): { value: string; used: number } | null {
-  const q = first[0];
-  let closed: (l: string) => boolean;
-  if ((q === '"' || q === "'") && !(first.length > 1 && first.endsWith(q))) {
-    closed = (l) => l.endsWith(q);
-  } else if (PEM_BEGIN.test(first) && !PEM_END.test(first)) {
-    closed = (l) => PEM_END.test(l);
-  } else {
-    return null;
-  }
-  const parts = [first];
-  for (let j = next; j < lines.length && j - next < MAX_MULTILINE; j++) {
-    const l = lines[j].trim();
-    parts.push(l);
-    if (closed(l)) return { value: unquote(parts.join("\n")), used: j - next + 1 };
-  }
-  return null; // 一直没闭合:当普通单行处理,不吞后面的行
-}
-
-/** 还原 properties 转义:\uXXXX、\t \n \r \f,其余 \X 取 X。 */
-function unescapeProps(s: string): string {
-  return s.replace(/\\(u[0-9a-fA-F]{4}|.)/g, (_, c: string) => {
-    if (c.length === 5) return String.fromCharCode(parseInt(c.slice(1), 16));
-    return { t: "\t", n: "\n", r: "\r", f: "\f" }[c] ?? c;
-  });
-}
-
-/** Java properties:# / ! 注释、行尾奇数个 \ 续行、分隔符为 = : 或空白。 */
-function propertiesEntries(text: string): Entry[] {
-  const out: Entry[] = [];
-  const lines = text.replace(/\r\n?/g, "\n").split("\n");
-  for (let i = 0; i < lines.length; i++) {
-    const line = i + 1;
-    let logical = lines[i].replace(/^\s+/, "");
-    if (!logical || logical[0] === "#" || logical[0] === "!") continue;
-    // 续行:末尾连续反斜杠为奇数个时,拼上下一行(去掉其行首空白)
-    while (/(^|[^\\])(\\\\)*\\$/.test(logical) && i + 1 < lines.length) {
-      logical = logical.slice(0, -1) + lines[++i].replace(/^\s+/, "");
+  // 从 from 行起收集到满足 closed 的那一行(含)
+  const until = (from: number, head: string[], closed: (l: string) => boolean) => {
+    const parts = [...head];
+    for (let j = from; j < lines.length && j - from < MAX_MULTILINE; j++) {
+      const l = lines[j].trim();
+      parts.push(l);
+      if (closed(l)) return { value: unquote(parts.join("\n")), used: j - next + 1 };
     }
-    const m = logical.match(/^((?:\\.|[^\\\s=:])*)\s*[=:]?\s*(.*)$/s)!;
-    const key = unescapeProps(m[1]);
-    const value = unescapeProps(m[2].replace(/\s+$/, ""));
-    out.push({ key, value: fmtText(value), line });
+    return null;
+  };
+
+  const block = first.match(/^([|>])[-+0-9]*$/);
+  if (block || first === "") {
+    let j = next;
+    while (j < lines.length && !lines[j].trim()) j++;
+    if (j >= lines.length) return null;
+    if (/^-----BEGIN /.test(lines[j].trim())) return until(j, [], (l) => PEM_END.test(l));
+    if (!block) return null;
+    const body: string[] = [];
+    let k = j;
+    for (; k < lines.length; k++) {
+      if (lines[k].trim() && indentOf(lines[k]) <= keyIndent) break;
+      body.push(lines[k]);
+    }
+    while (body.length && !body[body.length - 1].trim()) body.pop();
+    if (!body.length) return null;
+    const dedent = Math.min(...body.filter((l) => l.trim()).map(indentOf));
+    const text = body.map((l) => l.replace(/\t/g, "  ").slice(dedent).replace(/\s+$/, ""));
+    return { value: text.join(block[1] === ">" ? " " : "\n"), used: j - next + body.length };
   }
-  return out;
+
+  const q = first[0];
+  if ((q === '"' || q === "'") && !(first.length > 1 && first.endsWith(q))) {
+    return until(next, [first], (l) => l.endsWith(q));
+  }
+  if (PEM_BEGIN.test(first) && !PEM_END.test(first)) {
+    return until(next, [first], (l) => PEM_END.test(l));
+  }
+  return null;
 }
 
 type LineMode = "yaml" | "toml" | "raw";
@@ -159,14 +161,15 @@ function lineEntries(text: string, mode: LineMode): Entry[] {
     }
     let key = unquote(m[1].trim());
     let value = unquote(m[3].trim());
-    const multi = mode === "yaml" ? multilineValue(m[3].trim(), lines, idx + 1) : null;
+    const multi =
+      mode === "yaml" ? multilineValue(m[3].trim(), lines, idx + 1, indentOf(src)) : null;
     if (multi) {
       value = fmtText(multi.value);
       idx += multi.used;
     }
     if (mode === "toml" && section) key = `${section}.${key}`;
     if (mode === "yaml" && m[2] === ":") {
-      const indent = src.match(/^\s*/)![0].replace(/\t/g, "  ").length;
+      const indent = indentOf(src);
       while (stack.length && stack[stack.length - 1].indent >= indent) stack.pop();
       const full = [...stack.map((s) => s.key), key].join(".");
       if (value === "") stack.push({ indent, key });
