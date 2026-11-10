@@ -18,9 +18,16 @@ export interface Entry {
   raw?: boolean;
 }
 
+/** 多行文本压成一行显示(换行写成 \n)。末尾换行不算差异:
+ *  同一段证书用 `|` 块写会带末尾换行,用引号写不带,不应判成不同。 */
+function fmtText(v: string): string {
+  const t = v.replace(/\n+$/, "");
+  return t.includes("\n") ? JSON.stringify(t) : t;
+}
+
 function fmtValue(v: unknown): string {
   if (v === null || v === undefined) return "";
-  if (typeof v === "string") return v.includes("\n") ? JSON.stringify(v) : v;
+  if (typeof v === "string") return fmtText(v);
   if (typeof v === "object") return JSON.stringify(v);
   return String(v);
 }
@@ -63,7 +70,36 @@ function walkYaml(
   }
 }
 
-const unquote = (s: string) => s.replace(/^(["'])(.*)\1$/, "$2");
+const unquote = (s: string) => s.replace(/^(["'])(.*)\1$/s, "$2");
+
+const PEM_BEGIN = /-----BEGIN [^-]+-----/;
+const PEM_END = /-----END [^-]+-----/;
+const MAX_MULTILINE = 200;
+
+/** 逐行兜底时识别跨行的值:引号没闭合,或 PEM 块没结束(私钥 / 证书常被顶格直接贴进来,
+ *  这不是合法 YAML,所以整份才会落到兜底)。返回合并后的值和多用掉的行数;不是跨行值返回 null。 */
+function multilineValue(
+  first: string,
+  lines: string[],
+  next: number
+): { value: string; used: number } | null {
+  const q = first[0];
+  let closed: (l: string) => boolean;
+  if ((q === '"' || q === "'") && !(first.length > 1 && first.endsWith(q))) {
+    closed = (l) => l.endsWith(q);
+  } else if (PEM_BEGIN.test(first) && !PEM_END.test(first)) {
+    closed = (l) => PEM_END.test(l);
+  } else {
+    return null;
+  }
+  const parts = [first];
+  for (let j = next; j < lines.length && j - next < MAX_MULTILINE; j++) {
+    const l = lines[j].trim();
+    parts.push(l);
+    if (closed(l)) return { value: unquote(parts.join("\n")), used: j - next + 1 };
+  }
+  return null; // 一直没闭合:当普通单行处理,不吞后面的行
+}
 
 /** 还原 properties 转义:\uXXXX、\t \n \r \f,其余 \X 取 X。 */
 function unescapeProps(s: string): string {
@@ -88,7 +124,7 @@ function propertiesEntries(text: string): Entry[] {
     const m = logical.match(/^((?:\\.|[^\\\s=:])*)\s*[=:]?\s*(.*)$/s)!;
     const key = unescapeProps(m[1]);
     const value = unescapeProps(m[2].replace(/\s+$/, ""));
-    out.push({ key, value: value.includes("\n") ? JSON.stringify(value) : value, line });
+    out.push({ key, value: fmtText(value), line });
   }
   return out;
 }
@@ -101,16 +137,17 @@ function lineEntries(text: string, mode: LineMode): Entry[] {
   const stack: { indent: number; key: string }[] = []; // yaml 兜底:按缩进还原父级
   let section = ""; // toml:[section]
   const lines = text.replace(/\r\n?/g, "\n").split("\n");
-  lines.forEach((src, idx) => {
+  for (let idx = 0; idx < lines.length; idx++) {
+    const src = lines[idx];
     const line = idx + 1;
     let t = src.trim();
-    if (!t) return;
-    if (mode === "raw" ? /^<!--.*-->$/.test(t) : /^(#|!|;|\/\/)/.test(t)) return;
+    if (!t) continue;
+    if (mode === "raw" ? /^<!--.*-->$/.test(t) : /^(#|!|;|\/\/)/.test(t)) continue;
     if (mode === "toml") {
       const sec = t.match(/^\[+([^\]]+)\]+$/);
       if (sec) {
         section = sec[1].trim();
-        return;
+        continue;
       }
     }
     // 行尾注释:空白后的 #(raw 模式下 XML / HTML 里的 # 是正文,不剥)
@@ -118,10 +155,15 @@ function lineEntries(text: string, mode: LineMode): Entry[] {
     const m = mode === "raw" ? null : t.match(/^([^=:\s][^=:]*?)\s*([=:])\s*(.*)$/);
     if (!m) {
       out.push({ key: t, value: "", line, raw: true });
-      return;
+      continue;
     }
     let key = unquote(m[1].trim());
-    const value = unquote(m[3].trim());
+    let value = unquote(m[3].trim());
+    const multi = mode === "yaml" ? multilineValue(m[3].trim(), lines, idx + 1) : null;
+    if (multi) {
+      value = fmtText(multi.value);
+      idx += multi.used;
+    }
     if (mode === "toml" && section) key = `${section}.${key}`;
     if (mode === "yaml" && m[2] === ":") {
       const indent = src.match(/^\s*/)![0].replace(/\t/g, "  ").length;
@@ -131,7 +173,7 @@ function lineEntries(text: string, mode: LineMode): Entry[] {
       key = full;
     }
     out.push({ key, value, line });
-  });
+  }
   if (mode !== "yaml") return out;
   // yaml 兜底:去掉只起分组作用的父级行(如 `db:`),它们的子项已带完整路径
   const parents = new Set(out.map((e) => e.key.slice(0, e.key.lastIndexOf("."))));
