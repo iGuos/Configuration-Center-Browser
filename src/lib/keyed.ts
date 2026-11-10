@@ -131,6 +131,34 @@ function multilineValue(
   return null;
 }
 
+/** 还原 properties 转义:\uXXXX、\t \n \r \f,其余 \X 取 X。 */
+function unescapeProps(s: string): string {
+  return s.replace(/\\(u[0-9a-fA-F]{4}|.)/g, (_, c: string) => {
+    if (c.length === 5) return String.fromCharCode(parseInt(c.slice(1), 16));
+    return { t: "\t", n: "\n", r: "\r", f: "\f" }[c] ?? c;
+  });
+}
+
+/** Java properties:# / ! 注释、行尾奇数个 \ 续行、分隔符为 = : 或空白。 */
+function propertiesEntries(text: string): Entry[] {
+  const out: Entry[] = [];
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = i + 1;
+    let logical = lines[i].replace(/^\s+/, "");
+    if (!logical || logical[0] === "#" || logical[0] === "!") continue;
+    // 续行:末尾连续反斜杠为奇数个时,拼上下一行(去掉其行首空白)
+    while (/(^|[^\\])(\\\\)*\\$/.test(logical) && i + 1 < lines.length) {
+      logical = logical.slice(0, -1) + lines[++i].replace(/^\s+/, "");
+    }
+    const m = logical.match(/^((?:\\.|[^\\\s=:])*)\s*[=:]?\s*(.*)$/s)!;
+    const key = unescapeProps(m[1]);
+    const value = unescapeProps(m[2].replace(/\s+$/, ""));
+    out.push({ key, value: fmtText(value), line });
+  }
+  return out;
+}
+
 type LineMode = "yaml" | "toml" | "raw";
 
 /** 逐行解析(YAML 解析失败的兜底 / properties / TOML / 其它文本)。 */
